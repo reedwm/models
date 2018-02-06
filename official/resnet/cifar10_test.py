@@ -65,42 +65,62 @@ class BaseTest(tf.test.TestCase):
         [_BATCH_SIZE], maxval=9, dtype=tf.int32)
     return features, tf.one_hot(labels, 10)
 
-  def cifar10_model_fn_helper(self, mode):
-    features, labels = self.input_fn()
-    spec = cifar10_main.cifar10_model_fn(
-        features, labels, mode, {
-            'resnet_size': 32,
-            'data_format': 'channels_last',
-            'batch_size': _BATCH_SIZE,
-        })
+  def cifar10_model_fn_helper(self, mode, use_fp16):
+    with tf.Graph().as_default() as g:
+      features, labels = self.input_fn()
+      spec = cifar10_main.cifar10_model_fn(
+          features, labels, mode, {
+              'resnet_size': 32,
+              'data_format': 'channels_last',
+              'batch_size': _BATCH_SIZE,
+              'use_fp16': use_fp16,
+              'fp16_loss_scale': 128,
+          })
 
-    predictions = spec.predictions
-    self.assertAllEqual(predictions['probabilities'].shape,
-                        (_BATCH_SIZE, 10))
-    self.assertEqual(predictions['probabilities'].dtype, tf.float32)
-    self.assertAllEqual(predictions['classes'].shape, (_BATCH_SIZE,))
-    self.assertEqual(predictions['classes'].dtype, tf.int64)
+      predictions = spec.predictions
+      self.assertAllEqual(predictions['probabilities'].shape,
+                          (_BATCH_SIZE, 10))
+      self.assertEqual(predictions['probabilities'].dtype, tf.float32)
+      self.assertAllEqual(predictions['classes'].shape, (_BATCH_SIZE,))
+      self.assertEqual(predictions['classes'].dtype, tf.int64)
 
-    if mode != tf.estimator.ModeKeys.PREDICT:
-      loss = spec.loss
-      self.assertAllEqual(loss.shape, ())
-      self.assertEqual(loss.dtype, tf.float32)
+      if mode != tf.estimator.ModeKeys.PREDICT:
+        loss = spec.loss
+        self.assertAllEqual(loss.shape, ())
+        self.assertEqual(loss.dtype, tf.float32)
 
-    if mode == tf.estimator.ModeKeys.EVAL:
-      eval_metric_ops = spec.eval_metric_ops
-      self.assertAllEqual(eval_metric_ops['accuracy'][0].shape, ())
-      self.assertAllEqual(eval_metric_ops['accuracy'][1].shape, ())
-      self.assertEqual(eval_metric_ops['accuracy'][0].dtype, tf.float32)
-      self.assertEqual(eval_metric_ops['accuracy'][1].dtype, tf.float32)
+      if mode == tf.estimator.ModeKeys.EVAL:
+        eval_metric_ops = spec.eval_metric_ops
+        self.assertAllEqual(eval_metric_ops['accuracy'][0].shape, ())
+        self.assertAllEqual(eval_metric_ops['accuracy'][1].shape, ())
+        self.assertEqual(eval_metric_ops['accuracy'][0].dtype, tf.float32)
+        self.assertEqual(eval_metric_ops['accuracy'][1].dtype, tf.float32)
+
+      for v in tf.trainable_variables():
+        self.assertEqual(v.dtype.base_dtype, tf.float32)
+
+      expected_dtype = tf.float16 if use_fp16 else tf.float32
+      tensors_to_check = ('initial_conv:0', 'block_layer1:0', 'block_layer2:0',
+                          'block_layer3:0', 'final_avg_pool:0', 'final_dense:0')
+
+      for tensor_name in tensors_to_check:
+        tensor = g.get_tensor_by_name('resnet_model/' + tensor_name)
+        self.assertEqual(tensor.dtype, expected_dtype,
+                         'Tensor {} has dtype {}, while dtype {} was '
+                         'expected'.format(tensor, tensor.dtype,
+                                           expected_dtype))
 
   def test_cifar10_model_fn_train_mode(self):
-    self.cifar10_model_fn_helper(tf.estimator.ModeKeys.TRAIN)
+    self.cifar10_model_fn_helper(tf.estimator.ModeKeys.TRAIN, use_fp16=False)
+    self.cifar10_model_fn_helper(tf.estimator.ModeKeys.TRAIN, use_fp16=True)
 
   def test_cifar10_model_fn_eval_mode(self):
-    self.cifar10_model_fn_helper(tf.estimator.ModeKeys.EVAL)
+    self.cifar10_model_fn_helper(tf.estimator.ModeKeys.EVAL, use_fp16=False)
+    self.cifar10_model_fn_helper(tf.estimator.ModeKeys.EVAL, use_fp16=True)
 
   def test_cifar10_model_fn_predict_mode(self):
-    self.cifar10_model_fn_helper(tf.estimator.ModeKeys.PREDICT)
+    self.cifar10_model_fn_helper(tf.estimator.ModeKeys.PREDICT, use_fp16=False)
+    self.cifar10_model_fn_helper(tf.estimator.ModeKeys.PREDICT, use_fp16=True)
 
 
 if __name__ == '__main__':

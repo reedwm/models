@@ -228,7 +228,7 @@ class Model(object):
   def __init__(self, resnet_size, num_classes, num_filters, kernel_size,
                conv_stride, first_pool_size, first_pool_stride,
                second_pool_size, second_pool_stride, block_fn, block_sizes,
-               block_strides, final_size, data_format=None):
+               block_strides, final_size, data_format=None, use_fp16=False):
     """Creates a model for classifying an image.
 
     Args:
@@ -255,6 +255,7 @@ class Model(object):
       final_size: The expected size of the model after the second pooling.
       data_format: Input format ('channels_last', 'channels_first', or None).
         If set to None, the format is dependent on whether a GPU is available.
+      use_fp16: If True, use fp16 tensors in the model.
     """
     self.resnet_size = resnet_size
 
@@ -275,6 +276,60 @@ class Model(object):
     self.block_sizes = block_sizes
     self.block_strides = block_strides
     self.final_size = final_size
+    self.use_fp16 = use_fp16
+
+
+  def _fp16_custom_getter(self, getter, name, shape=None, dtype=tf.float32,
+                          *args, **kwargs):
+    """Creates variables in fp32, then casts to fp16 if necessary.
+
+    This function is a custom getter. A custom getter is a function with the
+    same signature as tf.get_variable, except it has an additional getter
+    parameter. Custom getters can be passed as the `custom_getter` parameter of
+    tf.variable_scope. Then, tf.get_variable will call the custom getter,
+    instead of directly getting a variable itself. This can be used to change
+    the types of variables that are retrieved with tf.get_variable.
+
+    The `getter` parameter is the underlying variable getter, that would have
+    been called if no custom getter was used. Custom getters typically get a
+    variable with `getter`, then modify it in some way.
+
+    This custom getter will create an fp32 variable if an fp16 variable was
+    requested. It will then cast the variable to fp16 and return the result.
+    The reason we do not directly create variables in fp16 is that applying
+    small gradients to fp16 variables may cause the variable not to change. This
+    is because fp16 variables have very low precision.
+
+    Args:
+      getter: The underlying variable getter, that has the same signature as
+        tf.get_variable and returns a variable.
+      name: The name of the variable to get.
+      shape: The shape of the variable to get.
+      dtype: The dtype of the variable to get. Note that if this if tf.float16,
+        the variable will be created as a tf.float32 variable, then casted to
+        tf.float16
+      *args: Additional arguments to pass unmodified to getter.
+      **kwargs: Additional keyword arguments to pass unmodified to getter.
+    """
+    if dtype == tf.float16:
+      var = getter(name, shape, tf.float32, *args, **kwargs)
+      return tf.cast(var, tf.float16, name=name + '_casted')
+    else:
+      return getter(name, shape, dtype, *args, **kwargs)
+
+
+  def _model_variable_scope(self):
+    """Returns a variable scope that the model should be created under.
+
+    If self.use_fp16 is True, model variable will be created in fp32 then casted
+    to fp16 before being used.
+
+    Returns:
+      A variable scope for the model.
+    """
+    custom_getter = self._fp16_custom_getter if self.use_fp16 else None
+    return tf.variable_scope('resnet_model', custom_getter=custom_getter)
+
 
   def __call__(self, inputs, training):
     """Add operations to classify a batch of input images.
@@ -288,43 +343,44 @@ class Model(object):
       A logits Tensor with shape [<batch_size>, self.num_classes].
     """
 
-    if self.data_format == 'channels_first':
-      # Convert the inputs from channels_last (NHWC) to channels_first (NCHW).
-      # This provides a large performance boost on GPU. See
-      # https://www.tensorflow.org/performance/performance_guide#data_formats
-      inputs = tf.transpose(inputs, [0, 3, 1, 2])
+    with self._model_variable_scope():
+      if self.data_format == 'channels_first':
+        # Convert the inputs from channels_last (NHWC) to channels_first (NCHW).
+        # This provides a large performance boost on GPU. See
+        # https://www.tensorflow.org/performance/performance_guide#data_formats
+        inputs = tf.transpose(inputs, [0, 3, 1, 2])
 
-    inputs = conv2d_fixed_padding(
-        inputs=inputs, filters=self.num_filters, kernel_size=self.kernel_size,
-        strides=self.conv_stride, data_format=self.data_format)
-    inputs = tf.identity(inputs, 'initial_conv')
+      inputs = conv2d_fixed_padding(
+          inputs=inputs, filters=self.num_filters, kernel_size=self.kernel_size,
+          strides=self.conv_stride, data_format=self.data_format)
+      inputs = tf.identity(inputs, 'initial_conv')
 
-    if self.first_pool_size:
-      inputs = tf.layers.max_pooling2d(
-          inputs=inputs, pool_size=self.first_pool_size,
-          strides=self.first_pool_stride, padding='SAME',
+      if self.first_pool_size:
+        inputs = tf.layers.max_pooling2d(
+            inputs=inputs, pool_size=self.first_pool_size,
+            strides=self.first_pool_stride, padding='SAME',
+            data_format=self.data_format)
+        inputs = tf.identity(inputs, 'initial_max_pool')
+
+      for i, num_blocks in enumerate(self.block_sizes):
+        num_filters = self.num_filters * (2**i)
+        inputs = block_layer(
+            inputs=inputs, filters=num_filters, block_fn=self.block_fn,
+            blocks=num_blocks, strides=self.block_strides[i],
+            training=training, name='block_layer{}'.format(i + 1),
+            data_format=self.data_format)
+
+      inputs = batch_norm_relu(inputs, training, self.data_format)
+      inputs = tf.layers.average_pooling2d(
+          inputs=inputs, pool_size=self.second_pool_size,
+          strides=self.second_pool_stride, padding='VALID',
           data_format=self.data_format)
-      inputs = tf.identity(inputs, 'initial_max_pool')
+      inputs = tf.identity(inputs, 'final_avg_pool')
 
-    for i, num_blocks in enumerate(self.block_sizes):
-      num_filters = self.num_filters * (2**i)
-      inputs = block_layer(
-          inputs=inputs, filters=num_filters, block_fn=self.block_fn,
-          blocks=num_blocks, strides=self.block_strides[i],
-          training=training, name='block_layer{}'.format(i + 1),
-          data_format=self.data_format)
-
-    inputs = batch_norm_relu(inputs, training, self.data_format)
-    inputs = tf.layers.average_pooling2d(
-        inputs=inputs, pool_size=self.second_pool_size,
-        strides=self.second_pool_stride, padding='VALID',
-        data_format=self.data_format)
-    inputs = tf.identity(inputs, 'final_avg_pool')
-
-    inputs = tf.reshape(inputs, [-1, self.final_size])
-    inputs = tf.layers.dense(inputs=inputs, units=self.num_classes)
-    inputs = tf.identity(inputs, 'final_dense')
-    return inputs
+      inputs = tf.reshape(inputs, [-1, self.final_size])
+      inputs = tf.layers.dense(inputs=inputs, units=self.num_classes)
+      inputs = tf.identity(inputs, 'final_dense')
+      return inputs
 
 
 ################################################################################
@@ -367,7 +423,8 @@ def learning_rate_with_decay(
 
 def resnet_model_fn(features, labels, mode, model_class,
                     resnet_size, weight_decay, learning_rate_fn, momentum,
-                    data_format, loss_filter_fn=None):
+                    data_format, use_fp16, fp16_loss_scale,
+                    loss_filter_fn=None):
   """Shared functionality for different resnet model_fns.
 
   Initializes the ResnetModel representing the model layers
@@ -391,6 +448,8 @@ def resnet_model_fn(features, labels, mode, model_class,
     momentum: momentum term used for optimization
     data_format: Input format ('channels_last', 'channels_first', or None).
       If set to None, the format is dependent on whether a GPU is available.
+    use_fp16: If True, use fp16 tensors in the model
+    fp16_loss_scale: The factor to scale the loss by when fp16 tensors are used.
     loss_filter_fn: function that takes a string variable name and returns
       True if the var should be included in loss calculation, and False
       otherwise. If None, batch_normalization variables will be excluded
@@ -403,8 +462,15 @@ def resnet_model_fn(features, labels, mode, model_class,
   # Generate a summary node for the images
   tf.summary.image('images', features, max_outputs=6)
 
-  model = model_class(resnet_size, data_format)
+  if use_fp16:
+    features = tf.cast(features, tf.float16)
+
+  model = model_class(resnet_size, data_format, use_fp16)
   logits = model(features, mode == tf.estimator.ModeKeys.TRAIN)
+
+  # This acts as a no-op if the logits are already in fp32. If use_fp16 is True,
+  # logits will be in fp16, and must be casted to fp32 for numerical stability.
+  logits = tf.cast(logits, tf.float32)
 
   predictions = {
       'classes': tf.argmax(logits, axis=1),
@@ -413,6 +479,7 @@ def resnet_model_fn(features, labels, mode, model_class,
 
   if mode == tf.estimator.ModeKeys.PREDICT:
     return tf.estimator.EstimatorSpec(mode=mode, predictions=predictions)
+
 
   # Calculate loss, which includes softmax cross entropy and L2 regularization.
   cross_entropy = tf.losses.softmax_cross_entropy(
@@ -430,7 +497,7 @@ def resnet_model_fn(features, labels, mode, model_class,
 
   # Add weight decay to the loss.
   loss = cross_entropy + weight_decay * tf.add_n(
-      [tf.nn.l2_loss(v) for v in tf.trainable_variables()
+      [tf.nn.l2_loss(tf.cast(v, tf.float32)) for v in tf.trainable_variables()
        if loss_filter_fn(v.name)])
 
   if mode == tf.estimator.ModeKeys.TRAIN:
@@ -449,7 +516,17 @@ def resnet_model_fn(features, labels, mode, model_class,
     # Batch norm requires update ops to be added as a dependency to train_op
     update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
     with tf.control_dependencies(update_ops):
-      train_op = optimizer.minimize(loss, global_step)
+      if use_fp16:
+        # When computing fp16 gradients, often intermediate tensor values are
+        # so small, they underflow to 0. To avoid this, we multiply the loss by
+        # fp16_loss_scale to make these tensor values fp16_loss_scales times
+        # bigger.
+        scaled_grad_vars = optimizer.compute_gradients(loss * fp16_loss_scale)
+        unscaled_grad_vrars = [(grad / fp16_loss_scale, var)
+                               for grad, var in scaled_grad_vars]
+        train_op = optimizer.apply_gradients(unscaled_grad_vrars, global_step)
+      else:
+        train_op = optimizer.minimize(loss, global_step)
   else:
     train_op = None
 
@@ -481,6 +558,8 @@ def resnet_main(flags, model_function, input_function):
           'resnet_size': flags.resnet_size,
           'data_format': flags.data_format,
           'batch_size': flags.batch_size,
+          'use_fp16': flags.use_fp16,
+          'fp16_loss_scale': flags.fp16_loss_scale,
       })
 
   for _ in range(flags.train_epochs // flags.epochs_per_eval):
@@ -545,3 +624,20 @@ class ResnetArgParser(argparse.ArgumentParser):
              'is not always compatible with CPU. If left unspecified, '
              'the data format will be chosen automatically based on '
              'whether TensorFlow was built for CPU or GPU.')
+
+    self.add_argument(
+        '--use_fp16', type=bool, default=False,
+        help='If true, run the model using fp16 tensors instead of fp32 '
+             'tensors.'
+    )
+
+    self.add_argument(
+        '--fp16_loss_scale', type=int, default=128,
+        help='The amount to scale the loss by when the model is run in fp16.'
+             'Before gradients are computed, the loss is multiplied by the'
+             'loss scale, making all gradients loss_scale times larger. To '
+             'adjust for this, gradients are divided by the loss scale before '
+             'being applied to variables. This is mathematically equivalent to '
+             'training without a loss scale, but the loss scale helps avoid '
+             'some intermediate gradients from underflowing to zero.'
+    )
