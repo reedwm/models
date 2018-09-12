@@ -54,9 +54,9 @@ _HR_KEY = "HR"
 _NDCG_KEY = "NDCG"
 
 
-def get_hit_rate_and_ndcg(predicted_scores_by_user, items_by_user, top_k=_TOP_K,
-                          match_mlperf=False):
-  """Returns the hit rate and the normalized DCG for evaluation.
+def get_hit_ratio_and_ndcg(predicted_scores_by_user, items_by_user, top_k=_TOP_K,
+                           match_mlperf=False, num_threads=None):
+  """Returns the hit ratio and the normalized DCG for evaluation.
 
   `predicted_scores_by_user` and `items_by_user` are parallel NumPy arrays with
   shape (num_users, num_items) such that `predicted_scores_by_user[i, j]` is the
@@ -105,10 +105,46 @@ def get_hit_rate_and_ndcg(predicted_scores_by_user, items_by_user, top_k=_TOP_K,
       user's first item is in the `top_k` top scores.
     match_mlperf: If True, compute HR and NDCG slightly differently to match the
       MLPerf reference implementation.
+    num_threads: How many threads to use for the computations.
 
   Returns:
     (hr, ndcg) tuple of floats, averaged across all users.
   """
+  num_users = predicted_scores_by_user.shape[0]
+  if not num_threads:
+    # Use only half the cores, to leave some for the async process.
+    num_threads = multiprocessing.cpu_count() // 2
+  if num_threads > num_users:
+    num_threads = num_users
+  if num_threads == 1:
+    results = [get_partial_hr_and_ndcg((predicted_scores_by_user, items_by_user,
+                                        top_k, match_mlperf))]
+  else:
+    users_per_batch = num_users // num_threads
+    num_extra = num_users - users_per_batch * num_threads
+    batch_sizes = ([users_per_batch] * (num_threads - num_extra) +
+                   [users_per_batch + 1] * num_extra)
+    divisions = np.cumsum(batch_sizes)[:-1]
+    score_batches = np.split(predicted_scores_by_user, divisions)
+    item_batches = np.split(items_by_user, divisions)
+
+    pool = multiprocessing.Pool(processes=num_threads)
+    args = zip(score_batches, item_batches, [top_k] * num_threads,
+               [match_mlperf] * num_threads)
+    results = pool.map(get_partial_hr_and_ndcg, args)
+  hr = sum(partial_hr for partial_hr, _ in results) / num_users
+  ndcg = sum(partial_ndcg for _, partial_ndcg in results) / num_users
+  return hr, ndcg
+
+
+def get_partial_hr_and_ndcg(args):
+  """Compute the partial HR and NDCG using a single thread.
+
+  This is the same as get_hit_ratio_and_ndcg, except it is not multithreaded and
+  does not divide the final HR and NDCG by num_users. Hence, the returned HR
+  and NDCG are num_users times greater than the actual HR and NDCG.
+  """
+  predicted_scores_by_user, items_by_user, top_k, match_mlperf = args
   num_users = predicted_scores_by_user.shape[0]
   zero_indices = np.zeros((num_users, 1), dtype=np.int32)
 
@@ -121,9 +157,9 @@ def get_hit_rate_and_ndcg(predicted_scores_by_user, items_by_user, top_k=_TOP_K,
     # equivalent to the MLPerf reference implementation.
     sorted_items_indices = items_by_user.argsort(kind="mergesort")
     sorted_items = items_by_user[
-        np.arange(num_users)[:, np.newaxis], sorted_items_indices]
+      np.arange(num_users)[:, np.newaxis], sorted_items_indices]
     sorted_predictions = predicted_scores_by_user[
-        np.arange(num_users)[:, np.newaxis], sorted_items_indices]
+      np.arange(num_users)[:, np.newaxis], sorted_items_indices]
 
     # For items that occur more than once in a user's row, set the predicted
     # score of the subsequent occurrences to -infinity, which effectively
@@ -150,9 +186,9 @@ def get_hit_rate_and_ndcg(predicted_scores_by_user, items_by_user, top_k=_TOP_K,
   # the positive example for a user is not in the top k, that index does not
   # appear. That is to say:   hit_ind.shape[0] <= num_users
   hit_ind = np.argwhere(np.equal(top_indicies, zero_indices))
-  hr = hit_ind.shape[0] / num_users
-  ndcg = np.sum(np.log(2) / np.log(hit_ind[:, 1] + 2)) / num_users
-  return hr, ndcg
+  partial_hr = hit_ind.shape[0]
+  partial_ndcg = np.sum(np.log(2) / np.log(hit_ind[:, 1] + 2))
+  return partial_hr, partial_ndcg
 
 
 def evaluate_model(estimator, ncf_dataset, pred_input_fn):
@@ -213,8 +249,8 @@ def evaluate_model(estimator, ncf_dataset, pred_input_fn):
 
   tf.logging.info("Computing metrics...")
 
-  hr, ndcg = get_hit_rate_and_ndcg(predicted_scores_by_user, items_by_user,
-                                   match_mlperf=FLAGS.ml_perf)
+  hr, ndcg = get_hit_ratio_and_ndcg(predicted_scores_by_user, items_by_user,
+                                    match_mlperf=FLAGS.ml_perf)
 
   global_step = estimator.get_variable_value(tf.GraphKeys.GLOBAL_STEP)
   eval_results = {
