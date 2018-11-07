@@ -24,7 +24,6 @@ import contextlib
 import datetime
 import gc
 import multiprocessing
-import multiprocessing.pool
 import json
 import os
 import pickle
@@ -32,12 +31,10 @@ import signal
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import timeit
 import traceback
 import typing
-import uuid
 
 import numpy as np
 import tensorflow as tf
@@ -54,18 +51,6 @@ from official.utils.logs import mlperf_helper
 
 _log_file = None
 
-
-# https://stackoverflow.com/questions/6974695/python-process-pool-non-daemonic
-class NoDaemonProcess(multiprocessing.Process):
-  # make 'daemon' attribute always return False
-  def _get_daemon(self):
-    return False
-  def _set_daemon(self, value):
-    pass
-  daemon = property(_get_daemon, _set_daemon)
-
-class NoDaemonPool(multiprocessing.pool.Pool):
-  Process = NoDaemonProcess
 
 def log_msg(msg):
   """Include timestamp info when logging messages to a file."""
@@ -201,7 +186,6 @@ def init_worker():
   signal.signal(signal.SIGINT, sigint_handler)
 
 
-
 def _construct_records(
     is_training,          # type: bool
     train_cycle,          # type: typing.Optional[int]
@@ -214,13 +198,14 @@ def _construct_records(
     epochs_per_cycle,     # type: int
     batch_size,           # type: int
     training_shards,      # type: typing.List[str]
-    queue_value,
-    queue_lock,
     deterministic=False,  # type: bool
-    match_mlperf=False,   # type: bool
-    seed=None,
+    match_mlperf=False    # type: bool
     ):
   """Generate false negatives and write TFRecords files.
+
+  After false negatives are created, this function spawns a process to write the
+  TFRecord files in the background. A running multiprocessing.Process is
+  returned that writes the TFRecord files.
 
   Args:
     is_training: Are training records (True) or eval records (False) created.
@@ -241,34 +226,20 @@ def _construct_records(
       to properly batch data when writing TFRecords.
     training_shards: The picked positive examples from which to generate
       negatives.
+
+  Returns:
+    A multiprocessing.Process that writes the TFRecord files.
   """
-  if is_training and train_cycle == 0:
-    worker_ind = 0
-  elif not is_training:
-    worker_ind = 1
-  else:
-    worker_ind = train_cycle + 1
-
-  # Wait to enter heavyweight pool
-  while True:
-    with queue_lock:
-      current_queue_value = queue_value.get()
-
-    if current_queue_value >= worker_ind:
-      break
-
-    time.sleep(0.1)
-
   st = timeit.default_timer()
 
   if is_training:
     mlperf_helper.ncf_print(key=mlperf_helper.TAGS.INPUT_STEP_TRAIN_NEG_GEN)
     mlperf_helper.ncf_print(
-      key=mlperf_helper.TAGS.INPUT_HP_NUM_NEG, value=num_neg)
+        key=mlperf_helper.TAGS.INPUT_HP_NUM_NEG, value=num_neg)
 
     # set inside _process_shard()
     mlperf_helper.ncf_print(
-      key=mlperf_helper.TAGS.INPUT_HP_SAMPLE_TRAIN_REPLACEMENT, value=True)
+        key=mlperf_helper.TAGS.INPUT_HP_SAMPLE_TRAIN_REPLACEMENT, value=True)
 
   else:
     # Later logic assumes that all items for a given user are in the same batch.
@@ -279,9 +250,6 @@ def _construct_records(
 
     mlperf_helper.ncf_print(key=mlperf_helper.TAGS.EVAL_HP_NUM_USERS,
                             value=num_positives)
-
-  if seed is not None:
-    np.random.seed(seed)
 
   assert epochs_per_cycle == 1 or is_training
   num_workers = min([num_workers, len(training_shards) * epochs_per_cycle])
@@ -330,54 +298,79 @@ def _construct_records(
 
     assert np.sum(data[0] == -1) == num_padding
 
-    # Close the pool and signal to the next process in line to begin its pool.
-    if is_training:
-      pool.close()
-      pool.terminate()
-      with queue_lock:
-        queue_value.value += 1
-
-    log_msg("Shuffling data...")
-    if is_training:
-      if num_padding:
-        # In order to have a full batch, randomly include points from earlier in
-        # the batch.
-
-        mlperf_helper.ncf_print(key=mlperf_helper.TAGS.INPUT_ORDER)
-        pad_sample_indices = np.random.randint(
-            low=0, high=num_pts, size=(num_padding,))
-        dest = np.arange(start=start_ind, stop=start_ind + num_padding)
-        start_ind += num_padding
-        for i in range(3):
-          data[i][dest] = data[i][pad_sample_indices]
-    else:
+    dupe_mask = None
+    if not is_training:
       # For Evaluation, padding is all zeros. The evaluation input_fn knows how
       # to interpret and discard the zero padded entries.
       data[0][num_pts:] = 0
 
-    # Check that no points were overlooked.
-    assert not np.sum(data[0] == -1)
+      # Check that no points were overlooked.
+      assert not np.sum(data[0] == -1)
 
-    if is_training:
-      dupe_mask = None
-    else:
       log_msg("Generating duplicate mask...")
       items_by_user = data[1].reshape(-1, num_neg + 1)
-      shard_indices = np.linspace(0, items_by_user.shape[0], num_workers + 1).astype("int")
-      sharded_items = [items_by_user[shard_indices[i]:shard_indices[i+1], :] for i in range(num_workers)]
-      dupe_generator = pool.starmap(stat_utils.mask_duplicates, [(sharded_items[i], 1) for i in range(num_workers)])
+      shard_indices = (np.linspace(0, items_by_user.shape[0], num_workers + 1)
+                       .astype("int"))
+      sharded_items = [items_by_user[shard_indices[i]:shard_indices[i+1], :]
+                       for i in range(num_workers)]
+      dupe_generator = pool.map(stat_utils.mask_duplicates, sharded_items)  # pylint: disable=no-member
 
-      dupe_mask = np.concatenate([i.astype(np.int8) for i in dupe_generator]).flatten()
+      dupe_mask = (np.concatenate([i.astype(np.int8) for i in dupe_generator])
+                   .flatten())
 
-      # The eval process has to hang onto its pool to compute the dupe mask.
-      pool.close()
-      pool.terminate()
-      with queue_lock:
-        queue_value.value += 1
+  log_msg(
+      "Data generation complete. (time: {:.1f} seconds)."
+      .format(timeit.default_timer() - st))
 
-  log_msg("Data generation complete. (time: {:.1f} seconds) Beginning file write."
-          .format(timeit.default_timer() - st))
+  seed = stat_utils.random_int32()
+  proc = multiprocessing.Process(target=write_shards, args=(
+      is_training, train_cycle, cache_paths, num_readers, batch_size,
+      data, dupe_mask, num_pts, st, seed))
+  proc.daemon = True
+  proc.start()
+  return proc
 
+
+def write_shards(is_training, train_cycle, cache_paths, num_readers, batch_size,
+                 data, dupe_mask, num_pts, st, seed):
+  """Write data shards to TFRecord files.
+
+  Args:
+    is_training: Are training records (True) or eval records (False) created.
+    train_cycle: Integer of which cycle the generated data is for.
+    cache_paths: Paths object with information of where to write files.
+    num_readers: The number of reader datasets in the input_fn. This number is
+      approximate; fewer shards will be created if not all shards are assigned
+      batches. This can occur due to discretization in the assignment process.
+    batch_size: The expected batch size used during training. This is used
+      to properly batch data when writing TFRecords.
+    data: List of three 1D numpy arrays: The users, the items, and the labels.
+    dupe_mask: A duplicate mask for the items in `data`. See
+      `stat_utils.mask_duplicates`.
+    num_pts: The number of examples. The size of each array in `data` is
+      `num_pts` plus some padding points.
+    st: The time right before the data was first generated. This is used to
+      print the time it took to generate and write the data.
+    seed: Random seed to use.
+  """
+  if seed is not None:
+    np.random.seed(seed)
+  (num_pts_with_padding,) = data[0].shape
+  if is_training:
+    log_msg("Shuffling data...")
+
+    num_padding = num_pts_with_padding - num_pts
+    if num_padding:
+      # In order to have a full batch, randomly include points from earlier in
+      # the batch.
+
+      mlperf_helper.ncf_print(key=mlperf_helper.TAGS.INPUT_ORDER)
+      pad_sample_indices = np.random.randint(
+          low=0, high=num_pts, size=(num_padding,))
+      dest = np.arange(start=num_pts, stop=num_pts + num_padding)
+      for i in range(3):
+        data[i][dest] = data[i][pad_sample_indices]
+      assert not np.sum(data[0] == -1)
   log_msg("Beginning shard write function...")
   if is_training:
     # The number of points is slightly larger than num_pts due to padding.
@@ -427,23 +420,21 @@ def _construct_records(
   else:
     template = rconst.EVAL_RECORD_TEMPLATE
     record_dir = cache_paths.eval_data_subdir
-
   temp_dir = None
   if record_dir.startswith("gs://"):
     temp_dir = tempfile.mkdtemp()
-
   log_msg("Begin writing records.")
-
   for i in range(num_readers):
-    fpath = os.path.join(temp_dir if temp_dir else record_dir, template.format(i))
+    fpath = os.path.join(temp_dir if temp_dir else record_dir,
+                         template.format(i))
     log_msg("Writing {}".format(fpath))
     with tf.python_io.TFRecordWriter(fpath) as writer:
       for j in batches_by_file[i]:
         start_ind = j * batch_size
         end_ind = start_ind + batch_size
         record_kwargs = dict(
-          users=data[0][start_ind:end_ind],
-          items=data[1][start_ind:end_ind],
+            users=data[0][start_ind:end_ind],
+            items=data[1][start_ind:end_ind],
         )
 
         if is_training:
@@ -454,19 +445,17 @@ def _construct_records(
         batch_bytes = _construct_record(**record_kwargs)
 
         writer.write(batch_bytes)
-
   if temp_dir:
-    if worker_ind <= 1:
+    if train_cycle == 0:
       # Lean on subprocess for first epoch and eval data for "-m"
-      subprocess.call(["gsutil", "-m", "cp", "-r", temp_dir + "/*", record_dir + "/"])
+      subprocess.call(
+          ["gsutil", "-m", "cp", "-r", temp_dir + "/*", record_dir + "/"])
     else:
       for i in tf.gfile.ListDirectory(temp_dir):
         tf.gfile.Copy(os.path.join(temp_dir, i), os.path.join(record_dir, i))
 
     tf.gfile.DeleteRecursively(temp_dir)
-
-  batch_count = sum([len(i) for i in batches_by_file])
-
+  batch_count = sum(len(i) for i in batches_by_file)
   # We write to a temp file then atomically rename it to the final file, because
   # writing directly to the final file can cause the main process to read a
   # partially written JSON file.
@@ -474,8 +463,8 @@ def _construct_records(
   ready_file_temp = os.path.join(record_dir, rconst.READY_FILE_TEMP)
   with tf.gfile.Open(ready_file_temp, "w") as f:
     json.dump({
-      "batch_size": batch_size,
-      "batch_count": batch_count,
+        "batch_size": batch_size,
+        "batch_count": batch_count,
     }, f)
   ready_file = os.path.join(record_dir, rconst.READY_FILE)
   tf.gfile.Rename(ready_file_temp, ready_file)
@@ -512,73 +501,68 @@ def _generation_loop(num_workers,           # type: int
   training_shards = [os.path.join(cache_paths.train_shard_subdir, i) for i in
                      tf.gfile.ListDirectory(cache_paths.train_shard_subdir)]
 
-  manager = multiprocessing.Manager()
-  queue_value = manager.Value(int, value=0)
-  queue_lock = manager.Lock()
   shared_kwargs = dict(
       num_workers=multiprocessing.cpu_count(), cache_paths=cache_paths,
       num_readers=num_readers, num_items=num_items,
       training_shards=training_shards, deterministic=deterministic,
-      match_mlperf=match_mlperf, queue_value=queue_value, queue_lock=queue_lock
+      match_mlperf=match_mlperf
   )
 
   gen_procs = deque()
   assert rconst.PARALLEL_GEN_EPOCHS >= 2
-  with NoDaemonPool(rconst.PARALLEL_GEN_EPOCHS) as high_level_pool:
-    # Training blocks on the creation of the first epoch, so the num_workers
-    # limit is not respected for this invocation
-    train_cycle = 0
+  # Training blocks on the creation of the first epoch, so the num_workers
+  # limit is not respected for this invocation
+  train_cycle = 0
+  proc = _construct_records(
+      is_training=True, train_cycle=train_cycle, num_neg=num_neg,
+      num_positives=num_train_positives, epochs_per_cycle=epochs_per_cycle,
+      batch_size=train_batch_size, **shared_kwargs)
+  gen_procs.append(proc)
 
-    gen_procs.append(high_level_pool.apply_async(func=_construct_records, kwds=dict(
+  # Construct evaluation set.
+  shared_kwargs["num_workers"] = num_workers
+  proc = _construct_records(
+      is_training=False, train_cycle=None, num_neg=rconst.NUM_EVAL_NEGATIVES,
+      num_positives=num_users, epochs_per_cycle=1, batch_size=eval_batch_size,
+      **shared_kwargs)
+  gen_procs.append(proc)
+
+  wait_count = 0
+  start_time = time.time()
+  while train_cycle < num_cycles:
+    ready_epochs = tf.gfile.ListDirectory(cache_paths.train_epoch_dir)
+    if len(ready_epochs) >= rconst.CYCLES_TO_BUFFER:
+      wait_count += 1
+      sleep_time = max([0, wait_count * 5 - (time.time() - start_time)])
+      time.sleep(sleep_time)
+
+      if (wait_count % 10) == 0:
+        log_msg("Waited {} times for data to be consumed."
+                .format(wait_count))
+
+      if time.time() - start_time > rconst.TIMEOUT_SECONDS:
+        log_msg("Waited more than {} seconds. Concluding that this "
+                "process is orphaned and exiting gracefully."
+                .format(rconst.TIMEOUT_SECONDS))
+        sys.exit()
+
+      continue
+
+    if len(gen_procs) >= rconst.PARALLEL_GEN_EPOCHS:
+      gen_procs.popleft().join()
+
+    train_cycle += 1
+    proc = _construct_records(
         is_training=True, train_cycle=train_cycle, num_neg=num_neg,
         num_positives=num_train_positives, epochs_per_cycle=epochs_per_cycle,
-        batch_size=train_batch_size, seed=stat_utils.random_int32(), **shared_kwargs
-    )))
-
-    # Construct evaluation set.
-    shared_kwargs["num_workers"] = num_workers
-    gen_procs.append(high_level_pool.apply_async(func=_construct_records, kwds=dict(
-        is_training=False, train_cycle=None, num_neg=rconst.NUM_EVAL_NEGATIVES,
-        num_positives=num_users, epochs_per_cycle=1, batch_size=eval_batch_size,
-        seed=stat_utils.random_int32(), **shared_kwargs
-    )))
+        batch_size=train_batch_size, **shared_kwargs)
+    gen_procs.append(proc)
 
     wait_count = 0
     start_time = time.time()
-
-    while train_cycle < num_cycles:
-      ready_epochs = tf.gfile.ListDirectory(cache_paths.train_epoch_dir)
-      if len(ready_epochs) >= rconst.CYCLES_TO_BUFFER:
-        wait_count += 1
-        sleep_time = max([0, wait_count * 5 - (time.time() - start_time)])
-        time.sleep(sleep_time)
-
-        if (wait_count % 10) == 0:
-          log_msg("Waited {} times for data to be consumed."
-                  .format(wait_count))
-
-        if time.time() - start_time > rconst.TIMEOUT_SECONDS:
-          log_msg("Waited more than {} seconds. Concluding that this "
-                  "process is orphaned and exiting gracefully."
-                  .format(rconst.TIMEOUT_SECONDS))
-          sys.exit()
-
-        continue
-
-      if len(gen_procs) >= rconst.PARALLEL_GEN_EPOCHS:
-        gen_procs.popleft().wait()
-
-      train_cycle += 1
-      gen_procs.append(high_level_pool.apply_async(func=_construct_records, kwds=dict(
-          is_training=True, train_cycle=train_cycle, num_neg=num_neg,
-          num_positives=num_train_positives, epochs_per_cycle=epochs_per_cycle,
-          batch_size=train_batch_size, seed=stat_utils.random_int32(), **shared_kwargs
-      )))
-
-      wait_count = 0
-      start_time = time.time()
-    [i.wait() for i in gen_procs]
-    gc.collect()
+  for proc in gen_procs:
+    proc.join()
+  gc.collect()
 
 
 def wait_for_path(fpath):
@@ -673,7 +657,7 @@ def main(_):
           train_batch_size=flags.FLAGS.train_batch_size,
           eval_batch_size=flags.FLAGS.eval_batch_size,
           deterministic=flags.FLAGS.seed is not None,
-          match_mlperf=flags.FLAGS.ml_perf
+          match_mlperf=flags.FLAGS.ml_perf,
       )
   except KeyboardInterrupt:
     log_msg("KeyboardInterrupt registered.")
